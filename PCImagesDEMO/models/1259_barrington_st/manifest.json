@@ -1,0 +1,49 @@
+{
+  "address": "1259 Barrington Street, Halifax, NS",
+  "geocode": {
+    "lat": 44.6411596,
+    "lon": -63.5707439,
+    "display_name": "1259, Barrington Street, Downtown Halifax, Halifax, Halifax Regional Municipality, Halifax County, Nova Scotia, B3J 1Y9, Canada"
+  },
+  "footprint": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -63.5708418520544,
+          44.6412043005115
+        ],
+        [
+          -63.5706849155278,
+          44.6412452073093
+        ],
+        [
+          -63.5706420050089,
+          44.641161174572
+        ],
+        [
+          -63.5707989769838,
+          44.6411203248196
+        ],
+        [
+          -63.5708418520544,
+          44.6412043005115
+        ]
+      ]
+    ]
+  },
+  "point_cloud": "building_crop.laz",
+  "lod22": "lod22.city.json",
+  "lod31": "lod31.city.json",
+  "images": [
+    {
+      "id": "102887461",
+      "url": "https://storage5.openstreetcam.org/files/photo/2017/8/22/proc/534227_c0f59_50.jpg",
+      "lat": 44.641057,
+      "lon": -63.570992,
+      "heading_deg": 80.27,
+      "distance_m": 22.7
+    }
+  ],
+  "notes": "LOD 3.1 openings are image-derived and approximate; walls without facing imagery are tagged no-coverage, not windowless."
+}

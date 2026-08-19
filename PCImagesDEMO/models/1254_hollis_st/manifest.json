@@ -1,0 +1,77 @@
+{
+  "address": "1254 Hollis Street, Halifax, NS",
+  "geocode": {
+    "lat": 44.6413026,
+    "lon": -63.5700379,
+    "display_name": "Acadia Suites, 1254, Hollis Street, South End, Halifax, Halifax Regional Municipality, Halifax County, Nova Scotia, B3J 3S4, Canada"
+  },
+  "footprint": {
+    "type": "Polygon",
+    "coordinates": [
+      [
+        [
+          -63.5699595593835,
+          44.6413878158558
+        ],
+        [
+          -63.5697918559193,
+          44.6414300989035
+        ],
+        [
+          -63.5697234553901,
+          44.6412927433024
+        ],
+        [
+          -63.5699595159884,
+          44.6412326566174
+        ],
+        [
+          -63.5699873612537,
+          44.6412255935614
+        ],
+        [
+          -63.5702227841058,
+          44.6411658611289
+        ],
+        [
+          -63.5702911784735,
+          44.6413036672728
+        ],
+        [
+          -63.5699595593835,
+          44.6413878158558
+        ]
+      ]
+    ]
+  },
+  "point_cloud": "building_crop.laz",
+  "lod22": "lod22.city.json",
+  "lod31": "lod31.city.json",
+  "images": [
+    {
+      "id": "30935184",
+      "url": "https://storage3.openstreetcam.org/files/photo/2017/5/1/proc/164743_e0a45_59078e7ded648.jpg",
+      "lat": 44.641483,
+      "lon": -63.569651,
+      "heading_deg": 241.59,
+      "distance_m": 36.6
+    },
+    {
+      "id": "67058183",
+      "url": "https://storage5.openstreetcam.org/files/photo/2017/7/20/proc/492247_d422f_28.jpg",
+      "lat": 44.641364,
+      "lon": -63.569665,
+      "heading_deg": 232.85,
+      "distance_m": 30.3
+    },
+    {
+      "id": "116764453",
+      "url": "https://storage5.openstreetcam.org/files/photo/2017/9/7/proc/581861_51256_22.jpg",
+      "lat": 44.641402,
+      "lon": -63.569686,
+      "heading_deg": 219.49,
+      "distance_m": 30.0
+    }
+  ],
+  "notes": "LOD 3.1 openings are image-derived and approximate; walls without facing imagery are tagged no-coverage, not windowless."
+}

@@ -1,0 +1,11 @@
+requests
+pyproj
+shapely
+numpy
+pillow
+transformers
+accelerate
+
+# torch/torchvision are hardware-specific -- install separately:
+#   GPU (CUDA 12.4):  pip install --index-url https://download.pytorch.org/whl/cu124 torch torchvision
+#   CPU only:          pip install --index-url https://download.pytorch.org/whl/cpu torch torchvision
