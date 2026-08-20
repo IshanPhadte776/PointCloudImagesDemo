@@ -855,6 +855,12 @@ def detect_openings_in_image(image_path: Path) -> list[dict]:
 
 DEPTH_MISMATCH_RATIO = 1.8  # reject a detection if estimated_depth_m and the geometric ray distance differ by more than this factor
 
+# KartaView doesn't report camera mount height or ground elevation, so the
+# vertical ray projection in backproject_opening assumes the camera stands at
+# roughly the same real-world (CGVD2013) ground elevation as the wall's own
+# base -- wall.z_min, not sea level or 0 -- plus a fixed eye/dash height.
+CAMERA_HEIGHT_M = 1.5
+
 
 def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg: float = 80.0) -> Optional[list]:
     """Approximate back-projection of a pixel rectangle onto a wall plane.
@@ -862,15 +868,29 @@ def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg
     Uses a pinhole-camera azimuth model (camera heading +/- half-FOV maps
     linearly across image width) to get a ray bearing per pixel column, then
     intersects that ray (from the image's lat/lon, converted to the wall's
-    local planar frame) with the wall's vertical plane. The image row maps
-    onto the wall's own real z-extent (top of image -> top of wall, bottom ->
-    base), and the horizontal hit point is clamped to the wall's own along-
-    extent -- earlier versions used an arbitrary wall vertex plus a fixed 6m
-    height guess, which let openings float above the roofline or off the
-    side of the building entirely (visible in early renders). If the ray hits
-    far outside the wall's own footprint, this is probably the wrong wall
-    (crude nearest-azimuth matching) rather than an edge case worth clamping,
-    so it's rejected instead of smeared onto the boundary.
+    local planar frame) with the wall's vertical plane; the horizontal hit
+    point is clamped to the wall's own along-extent -- earlier versions used
+    an arbitrary wall vertex plus a fixed 6m height guess, which let openings
+    float above the roofline or off the side of the building entirely
+    (visible in early renders). If the ray hits far outside the wall's own
+    footprint, this is probably the wrong wall (crude nearest-azimuth
+    matching) rather than an edge case worth clamping, so it's rejected
+    instead of smeared onto the boundary.
+
+    The vertical extent uses the same pinhole angular model as azimuth (a
+    per-row pitch angle off the camera's boresight, converted to real height
+    via (wall.z_min + CAMERA_HEIGHT_M) + horizontal_distance * tan(pitch) --
+    wall.z_min stands in for the camera's own real-world ground elevation,
+    which KartaView doesn't report) rather than linearly mapping image row to
+    the wall's own top/bottom. Confirmed as a
+    real bug via the actual output for 1254 Hollis St: the old "row 0 = top
+    of wall, row img_h = base of wall" assumption scaled every detection's
+    height against the *entire* multi-storey wall extent regardless of how
+    much of the frame it actually occupied, since a street photo never frames
+    a wall exactly edge to edge (there's always sky above and sidewalk
+    below) -- it produced windows 5-9.5m tall and a 7.24m door. The angular
+    model ties height to the same real horizontal ray distance already used
+    for width, so it comes out physically plausible instead.
     """
     # Use the *computed* bearing from camera GPS to the target building
     # (set by filter_facing_images) as the frame-center direction, not the
@@ -926,18 +946,30 @@ def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg
         return None  # hit point is nowhere near this wall -- likely the wrong wall
     s = min(max(s, wall.along_min), wall.along_max)
 
-    row_center = rect["py"] + rect["ph"] / 2
-    v_frac = row_center / rect["img_h"]
-    wall_height = wall.z_max - wall.z_min
-    z_center = wall.z_max - v_frac * wall_height
+    # Vertical field of view derived from hfov_deg and the image's aspect
+    # ratio (same assumption of square pixels/equal angular resolution on
+    # both axes already implicit in the horizontal-only azimuth model above).
+    img_h = rect["img_h"]
+    vfov_deg = math.degrees(2 * math.atan(math.tan(math.radians(hfov_deg) / 2) * (img_h / img_w)))
+
+    camera_elevation_m = wall.z_min + CAMERA_HEIGHT_M
+
+    def ray_height_at(row: float) -> float:
+        v_frac = 0.5 - (row / img_h)  # positive = above image center = looking upward
+        pitch_deg = v_frac * vfov_deg
+        return camera_elevation_m + t * math.tan(math.radians(pitch_deg))
+
+    z_top = ray_height_at(rect["py"])
+    z_bottom = ray_height_at(rect["py"] + rect["ph"])
 
     half_w = min((rect["pw"] / rect["img_w"]) * 3.0, wall_len / 2)  # rough angular-width-to-meters scaling
-    half_h = min((rect["ph"] / rect["img_h"]) * wall_height / 2, wall_height / 2)
 
     s1 = max(s - half_w, wall.along_min)
     s2 = min(s + half_w, wall.along_max)
-    z1 = max(z_center - half_h, wall.z_min)
-    z2 = min(z_center + half_h, wall.z_max)
+    z1 = max(min(z_top, z_bottom), wall.z_min)
+    z2 = min(max(z_top, z_bottom), wall.z_max)
+    if z2 <= z1:
+        return None  # projected entirely outside the wall's own real vertical extent
 
     p1 = plane_p + s1 * wall.along
     p2 = plane_p + s2 * wall.along
