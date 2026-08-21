@@ -612,7 +612,271 @@ def run_roofer(footprint_path: Path, laz_path: Path, out_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Stage 6: openings from images -> LOD 3.1
+# Stage 6: building dimensions -> dimensioned diagram
+# ---------------------------------------------------------------------------
+
+def compute_building_dimensions(footprint_geojson: dict, lod22_cityjson: dict, epsg: int) -> dict:
+    """Real-world footprint length/width, oriented to the building's own
+    walls via its minimum rotated bounding rectangle (not a naive
+    north-aligned bbox, which would overstate both dimensions for any
+    building not aligned to true north -- 1254 Hollis St's footprint sits at
+    roughly 70/160 degrees azimuth, confirmed against extract_wall_faces),
+    plus overall height taken directly from the LOD2.2 model's own vertices
+    (ground to highest roof point), not assumed from the street photos.
+    """
+    poly_wgs84 = footprint_polygon(footprint_geojson)
+    poly_proj = reproject_footprint(poly_wgs84, epsg)
+    rect = poly_proj.minimum_rotated_rectangle
+    corners = list(rect.exterior.coords)[:4]
+    edge_lengths = [
+        math.hypot(corners[(i + 1) % 4][0] - corners[i][0], corners[(i + 1) % 4][1] - corners[i][1])
+        for i in range(4)
+    ]
+    length_m = max(edge_lengths[0], edge_lengths[1])
+    width_m = min(edge_lengths[0], edge_lengths[1])
+
+    verts = np.array(lod22_cityjson.get("vertices", []), dtype=float)
+    height_m = float(verts[:, 2].max() - verts[:, 2].min()) if len(verts) else 0.0
+
+    return {
+        "length_m": round(length_m, 2),
+        "width_m": round(width_m, 2),
+        "height_m": round(height_m, 2),
+        "footprint_area_m2": round(poly_proj.area, 1),
+        "oriented_rect_corners": [list(c) for c in corners],
+    }
+
+
+def render_dimensions_diagram(footprint_geojson: dict, epsg: int, dims: dict,
+                               address: str, out_path: Path) -> Path:
+    """To-scale plan-view diagram of the footprint with dimension lines for
+    the oriented length/width and a height callout (see
+    compute_building_dimensions), so the model's real-world size is visible
+    at a glance instead of buried in manifest.json numbers.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    poly_wgs84 = footprint_polygon(footprint_geojson)
+    poly_proj = reproject_footprint(poly_wgs84, epsg)
+    fx, fy = poly_proj.exterior.xy
+
+    corners = dims["oriented_rect_corners"]
+    centroid = np.array(poly_proj.centroid.coords[0])
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    ax.plot(list(fx), list(fy), color="#2b6cb0", linewidth=2, zorder=3)
+    ax.fill(list(fx), list(fy), color="#bee3f8", alpha=0.5, zorder=1)
+    rect_x = [c[0] for c in corners] + [corners[0][0]]
+    rect_y = [c[1] for c in corners] + [corners[0][1]]
+    ax.plot(rect_x, rect_y, color="#a0aec0", linewidth=1, linestyle="--", zorder=2)
+
+    margin = max(dims["length_m"], dims["width_m"]) * 0.12
+
+    def dim_line(p0, p1, label):
+        p0, p1 = np.array(p0), np.array(p1)
+        mid = (p0 + p1) / 2
+        edge_dir = (p1 - p0) / (np.linalg.norm(p1 - p0) + 1e-9)
+        outward = mid - centroid
+        normal = np.array([-edge_dir[1], edge_dir[0]])
+        if np.dot(normal, outward) < 0:
+            normal = -normal
+        offset = normal * margin
+        o0, o1 = p0 + offset, p1 + offset
+        ax.annotate(
+            "", xy=o1, xytext=o0,
+            arrowprops=dict(arrowstyle="<->", color="#c53030", linewidth=1.5),
+            zorder=4,
+        )
+        label_pos = (o0 + o1) / 2 + normal * (margin * 0.25)
+        ax.text(label_pos[0], label_pos[1], label, color="#c53030", fontsize=11,
+                ha="center", va="center", fontweight="bold", zorder=5,
+                rotation=math.degrees(math.atan2(edge_dir[1], edge_dir[0])))
+
+    edge01 = math.hypot(corners[1][0] - corners[0][0], corners[1][1] - corners[0][1])
+    edge12 = math.hypot(corners[2][0] - corners[1][0], corners[2][1] - corners[1][1])
+    length_edge = (corners[0], corners[1]) if edge01 >= edge12 else (corners[1], corners[2])
+    width_edge = (corners[1], corners[2]) if edge01 >= edge12 else (corners[2], corners[3])
+
+    dim_line(length_edge[0], length_edge[1], f"{dims['length_m']:.2f} m")
+    dim_line(width_edge[0], width_edge[1], f"{dims['width_m']:.2f} m")
+
+    ax.set_aspect("equal")
+    ax.axis("off")
+    ax.set_title(
+        f"{address}\nfootprint {dims['length_m']:.2f} m x {dims['width_m']:.2f} m "
+        f"({dims['footprint_area_m2']:.0f} m²)  |  height {dims['height_m']:.2f} m",
+        fontsize=11,
+    )
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+    return out_path
+
+
+def _collect_semantic_surfaces(cityjson: dict) -> list:
+    """Every semantic surface (wall/roof/ground) in a CityJSON, as
+    (surface_type, points) pairs -- shares the same boundary-walking logic as
+    extract_wall_faces's walk(), generalized to every surface type instead of
+    filtering to just WallSurface, since a full building render needs the
+    whole envelope, not only the walls.
+    """
+    verts = np.array(cityjson.get("vertices", []), dtype=float)
+    collected: list = []
+
+    def walk(boundaries, sem_values, surfaces):
+        if sem_values is None or isinstance(sem_values, int):
+            return
+        for b, s in zip(boundaries, sem_values):
+            if isinstance(s, list):
+                walk(b, s, surfaces)
+            elif s is not None:
+                ring = b[0]
+                pts = verts[ring]
+                if len(pts) >= 3:
+                    collected.append((surfaces[s].get("type"), pts))
+
+    for obj in cityjson.get("CityObjects", {}).values():
+        for geom in obj.get("geometry", []):
+            semantics = geom.get("semantics", {})
+            surfaces = semantics.get("surfaces", [])
+            values = semantics.get("values", [])
+            walk(geom.get("boundaries", []), values, surfaces)
+
+    return collected
+
+
+SURFACE_COLORS = {"WallSurface": "#d2a679", "RoofSurface": "#c1666b", "GroundSurface": "#c9c9c9"}
+OPENING_COLORS = {"window": "#4fa3a3", "door": "#e07b39", "balcony": "#8e5fbf"}
+
+
+def render_building_model(cityjson: dict, dims: dict, title: str, out_path: Path,
+                           openings: Optional[list] = None, face_wall: Optional[WallFace] = None) -> Path:
+    """3D render of a CityJSON model (walls/roof/ground colored by semantic
+    type, optionally with +lod31_openings drawn as translucent quads on top),
+    with the real-world height/length/width baked directly into the image --
+    as dimension lines against the model's own footprint corners plus a
+    caption -- instead of only living in manifest.json/dimensions.png, so
+    render.png and render_lod31.png are self-describing on their own.
+
+    Camera orientation preference: `face_wall` (typically
+    determine_street_facing_wall's result, so both render.png and
+    render_lod31.png face the same street side of the building regardless of
+    whether openings were detected there) > the openings' own wall(s), if
+    given but face_wall isn't > an arbitrary corner.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+
+    surfaces = _collect_semantic_surfaces(cityjson)
+    all_pts = np.vstack([pts for _, pts in surfaces])
+    x_min, y_min, z_min = all_pts.min(axis=0)
+    x_max, y_max, z_max = all_pts.max(axis=0)
+    centroid_xy = np.array([(x_min + x_max) / 2, (y_min + y_max) / 2])
+
+    azim_deg, elev_deg = -60, 22
+    wall_by_index = {}
+    if openings:
+        # wall_surface_index on each opening refers to merge_coplanar_walls's
+        # output indices (that's what add_windows tagged them with), so the
+        # same merge is redone here to look up each wall's outward normal --
+        # needed below regardless of face_wall, to un-coplanar opening quads
+        # from their wall for rendering.
+        wall_by_index = {w.surface_index: w for w in merge_coplanar_walls(extract_wall_faces(cityjson))}
+
+    if face_wall is not None:
+        azim_deg = math.degrees(math.atan2(face_wall.normal[1], face_wall.normal[0]))
+    elif openings:
+        opening_wall_indices = {o["wall_surface_index"] for o in openings}
+        target_walls = [w for i, w in wall_by_index.items() if i in opening_wall_indices]
+        if target_walls:
+            avg_normal = np.mean([w.normal[:2] for w in target_walls], axis=0)
+            azim_deg = math.degrees(math.atan2(avg_normal[1], avg_normal[0]))
+
+    fig = plt.figure(figsize=(9, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.view_init(elev=elev_deg, azim=azim_deg)
+
+    for surf_type, pts in surfaces:
+        color = SURFACE_COLORS.get(surf_type, "#999999")
+        ax.add_collection3d(Poly3DCollection([pts], facecolor=color, edgecolor="#333333",
+                                              linewidths=0.5, alpha=0.85))
+
+    for o in openings or []:
+        color = OPENING_COLORS.get(o["type"], "#4fa3a3")
+        poly_pts = np.array(o["polygon"], dtype=float)
+        wall = wall_by_index.get(o["wall_surface_index"])
+        if wall is not None:
+            # Nudge slightly outward along the wall's own normal -- an
+            # opening polygon is exactly coplanar with its wall, and
+            # mplot3d's painter's-algorithm depth sort has no well-defined
+            # order for two coplanar polygons, so it was rendering the wall
+            # on top of the window/door instead of the other way around.
+            poly_pts = poly_pts + np.array([wall.normal[0], wall.normal[1], 0.0]) * 0.15
+        ax.add_collection3d(Poly3DCollection([poly_pts], facecolor=color, edgecolor="#222222",
+                                              linewidths=0.8, alpha=0.95))
+
+    # Dimension lines reuse the same oriented footprint rectangle already
+    # computed by compute_building_dimensions, rather than re-deriving it, but
+    # anchored to whichever corner faces the fixed camera angle above --
+    # mplot3d doesn't depth-sort Text/Line3D against Poly3DCollection
+    # reliably, so a dimension line on the far side of the box gets drawn
+    # *behind* the near wall and shows up as a faint, hard-to-read ghost
+    # instead of being hidden outright. Anchoring to the near corner's own
+    # two edges keeps every dimension line in open space in front of the
+    # model instead of leaving it to chance which edge the rectangle's own
+    # corner ordering happened to pick.
+    corners = [np.array(c) for c in dims["oriented_rect_corners"]]
+    cam_dir = np.array([math.cos(math.radians(azim_deg)), math.sin(math.radians(azim_deg))])
+    front_idx = max(range(4), key=lambda i: np.dot(corners[i] - centroid_xy, cam_dir))
+    prev_idx, next_idx = (front_idx - 1) % 4, (front_idx + 1) % 4
+    edge_a = (corners[prev_idx], corners[front_idx])
+    edge_b = (corners[front_idx], corners[next_idx])
+    len_a = np.linalg.norm(edge_a[1] - edge_a[0])
+    len_b = np.linalg.norm(edge_b[1] - edge_b[0])
+    length_edge, width_edge = (edge_a, edge_b) if len_a >= len_b else (edge_b, edge_a)
+    margin = max(dims["length_m"], dims["width_m"]) * 0.15
+
+    def offset_outward(p0, p1):
+        p0, p1 = np.array(p0), np.array(p1)
+        mid = (p0 + p1) / 2
+        edge_dir = (p1 - p0) / (np.linalg.norm(p1 - p0) + 1e-9)
+        normal = np.array([-edge_dir[1], edge_dir[0]])
+        if np.dot(normal, mid - centroid_xy) < 0:
+            normal = -normal
+        offset = normal * margin
+        return p0 + offset, p1 + offset
+
+    def dim_line_3d(p0, p1, z, label):
+        ax.plot([p0[0], p1[0]], [p0[1], p1[1]], [z, z], color="#c53030", linewidth=2, linestyle="--")
+        ax.text((p0[0] + p1[0]) / 2, (p0[1] + p1[1]) / 2, z, label,
+                 color="#c53030", fontsize=10, fontweight="bold")
+
+    o0, o1 = offset_outward(length_edge[0], length_edge[1])
+    dim_line_3d(o0, o1, z_min, f"L = {dims['length_m']:.2f} m")
+    o0, o1 = offset_outward(width_edge[0], width_edge[1])
+    dim_line_3d(o0, o1, z_min, f"W = {dims['width_m']:.2f} m")
+
+    corner = corners[front_idx]
+    corner_out = corner + (corner - centroid_xy) / (np.linalg.norm(corner - centroid_xy) + 1e-9) * margin
+    ax.plot([corner_out[0], corner_out[0]], [corner_out[1], corner_out[1]], [z_min, z_max],
+            color="#c53030", linewidth=2, linestyle="--")
+    ax.text(corner_out[0], corner_out[1], (z_min + z_max) / 2, f"H = {dims['height_m']:.2f} m",
+            color="#c53030", fontsize=10, fontweight="bold")
+
+    ax.set_title(f"{title}\nH {dims['height_m']:.2f} m  |  L {dims['length_m']:.2f} m  |  "
+                 f"W {dims['width_m']:.2f} m")
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=140)
+    plt.close(fig)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# Stage 7: openings from images -> LOD 3.1
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -862,7 +1126,8 @@ DEPTH_MISMATCH_RATIO = 1.8  # reject a detection if estimated_depth_m and the ge
 CAMERA_HEIGHT_M = 1.5
 
 
-def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg: float = 80.0) -> Optional[list]:
+def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg: float = 80.0,
+                         ignore_depth_check: bool = False) -> Optional[list]:
     """Approximate back-projection of a pixel rectangle onto a wall plane.
 
     Uses a pinhole-camera azimuth model (camera heading +/- half-FOV maps
@@ -891,6 +1156,14 @@ def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg
     below) -- it produced windows 5-9.5m tall and a 7.24m door. The angular
     model ties height to the same real horizontal ray distance already used
     for width, so it comes out physically plausible instead.
+
+    ignore_depth_check lets a caller (regularize_openings) recompute the
+    geometry for a detection that failed only the depth-mismatch check, to
+    see where it *would* have landed -- used to recover real windows on
+    upper floors, where Depth Anything's monocular estimate is systematically
+    less reliable (see regularize_openings), without silently disabling the
+    check for the normal path that still needs it to reject background
+    buildings.
     """
     # Use the *computed* bearing from camera GPS to the target building
     # (set by filter_facing_images) as the frame-center direction, not the
@@ -932,7 +1205,7 @@ def backproject_opening(rect: dict, image: StreetImage, wall: WallFace, hfov_deg
     # (ray-plane math has no way to know the photographed object is actually
     # much farther away) -- depth is the only signal that catches this.
     estimated_depth_m = rect.get("estimated_depth_m")
-    if estimated_depth_m is not None and estimated_depth_m > 0:
+    if not ignore_depth_check and estimated_depth_m is not None and estimated_depth_m > 0:
         ratio = estimated_depth_m / t
         if not (1 / DEPTH_MISMATCH_RATIO <= ratio <= DEPTH_MISMATCH_RATIO):
             return None
@@ -1012,12 +1285,129 @@ def classify_opening_type(poly: list, wall: WallFace, detected_label: Optional[s
 MIN_WALL_AREA_M2 = 4.0  # ignore sliver/fragment walls (over-segmentation noise) when picking a facing wall
 
 
+def nearest_facing_wall(walls: list[WallFace], bearing_deg: float) -> WallFace:
+    """Naive nearest-facing-wall match by azimuth similarity, restricted to
+    walls big enough to be real facades -- without this, a heavily
+    over-segmented roof can match a tiny sliver wall whose azimuth happens to
+    line up, and every opening then gets rejected by backproject_opening's
+    own-footprint check since the ray never actually lands on it. Shared
+    between add_windows (per image) and determine_street_facing_wall
+    (aggregated across every facing image, for orienting renders).
+    """
+    substantial = [w for w in walls if (w.along_max - w.along_min) * (w.z_max - w.z_min) >= MIN_WALL_AREA_M2]
+    candidates = substantial or walls
+    return min(candidates, key=lambda w: angle_diff_deg(w.azimuth_deg, (bearing_deg + 180) % 360))
+
+
+def determine_street_facing_wall(lod22_cityjson: dict, images: list[StreetImage]) -> Optional[WallFace]:
+    """Which wall the street-level images are actually facing, by majority
+    vote across every facing image (using the same per-image matching as
+    add_windows) -- so render.png/render_lod31.png can orient toward the
+    street side of the building instead of an arbitrary corner, even for
+    LOD2.2 (before any opening has been detected) or when a wall got no
+    detections at all.
+    """
+    if not images:
+        return None
+    walls = merge_coplanar_walls(extract_wall_faces(lod22_cityjson))
+    if not walls:
+        return None
+    votes: dict[int, int] = {}
+    matched: dict[int, WallFace] = {}
+    for image in images:
+        bearing = image.bearing_from_image_deg if image.bearing_from_image_deg else image.heading_deg
+        wall = nearest_facing_wall(walls, bearing)
+        votes[wall.surface_index] = votes.get(wall.surface_index, 0) + 1
+        matched[wall.surface_index] = wall
+    best_index = max(votes, key=votes.get)
+    return matched[best_index]
+
+
+FLOOR_Z_TOL_M = 1.5   # candidates within this height band are treated as the same floor/row
+MIN_ROW_MEMBERS = 2   # need at least this many candidates sharing a floor before completing gaps in it
+
+# Physically-plausible opening size, in metres -- a real window or door is
+# never a few centimetres across. Needed specifically because
+# ignore_depth_check removes backproject_opening's one check that would
+# otherwise catch a low-confidence Grounding DINO noise box (detection
+# threshold is a permissive 0.25): without the depth gate, backproject_
+# opening's off-wall margin (wall_len * 0.5) is generous enough that nearly
+# any ray lands somewhere on the wall, and plenty of noise boxes happen to
+# share a rough height with each other purely by chance -- confirmed
+# against a real run, where skipping this filter let 40+ obviously-fake
+# sub-30cm "windows" through regularize_openings's floor-banding.
+MIN_OPENING_WIDTH_M, MAX_OPENING_WIDTH_M = 0.3, 4.0
+MIN_OPENING_HEIGHT_M, MAX_OPENING_HEIGHT_M = 0.5, 6.0
+
+
+def _is_plausible_opening_size(poly: list) -> bool:
+    p1, p2, _p3, p4 = poly
+    width_m = math.hypot(p2[0] - p1[0], p2[1] - p1[1])
+    height_m = p4[2] - p1[2]
+    return (MIN_OPENING_WIDTH_M <= width_m <= MAX_OPENING_WIDTH_M
+            and MIN_OPENING_HEIGHT_M <= height_m <= MAX_OPENING_HEIGHT_M)
+
+
+def regularize_openings(candidates: list[dict]) -> list[dict]:
+    """Recover openings Grounding DINO found and geometrically placed on the
+    right wall, but that backproject_opening's per-box depth-mismatch check
+    rejected anyway.
+
+    Confirmed as a real failure mode on 1254 Hollis St: Depth Anything's
+    monocular depth estimate grows increasingly wrong for pixel rows far from
+    the camera's own eye level (looking sharply upward at a 2nd-floor row
+    from a close street-level photo), so every one of that floor's real,
+    clearly-detected windows failed the per-box depth check and vanished from
+    the LOD3.1 model even though DINO found all of them individually and they
+    photographically line up in an obviously real, evenly-spaced row.
+
+    Rather than trusting each box's own shaky monocular depth in isolation,
+    this looks for structural corroboration instead: a wall's real windows
+    come in rows sharing a floor, not as isolated points, so a
+    depth-rejected candidate is accepted if it shares a height band (see
+    FLOOR_Z_TOL_M) with at least one *other* candidate on the same wall --
+    confirmed or not. An isolated single rejected candidate with no such
+    corroboration is left rejected, same as before, since one bad-depth
+    detection alone doesn't distinguish a real recoverable window from a
+    background object that happened to geometrically line up with this wall.
+    Every candidate that already passed the depth check on its own merit
+    (depth_ok) is kept regardless of banding.
+    """
+    by_wall: dict[int, list[dict]] = {}
+    for c in candidates:
+        by_wall.setdefault(c["wall_surface_index"], []).append(c)
+
+    kept: list[dict] = []
+    for wall_candidates in by_wall.values():
+        wall_candidates.sort(key=lambda c: c["z_center"])
+        band: list[dict] = []
+
+        def flush(band):
+            promote = len(band) >= MIN_ROW_MEMBERS
+            for c in band:
+                if c["depth_ok"]:
+                    c["inferred"] = False
+                    kept.append(c)
+                elif promote:
+                    c["inferred"] = True
+                    kept.append(c)
+
+        for c in wall_candidates:
+            if band and c["z_center"] - band[-1]["z_center"] > FLOOR_Z_TOL_M:
+                flush(band)
+                band = []
+            band.append(c)
+        flush(band)
+
+    return kept
+
+
 def add_windows(lod22_path: Path, images: list[StreetImage], image_dir: Path, out_path: Path) -> Path:
     lod22 = json.loads(lod22_path.read_text())
     walls = merge_coplanar_walls(extract_wall_faces(lod22))
 
     lod31 = json.loads(json.dumps(lod22))  # deep copy, keep LOD2.2 untouched
-    openings_added = []
+    candidates = []
     walls_with_coverage: set[int] = set()
 
     for image in images:
@@ -1032,32 +1422,41 @@ def add_windows(lod22_path: Path, images: list[StreetImage], image_dir: Path, ou
         if not rects or not walls:
             continue
 
-        # naive nearest-facing-wall match by azimuth similarity, restricted to
-        # walls big enough to be real facades -- without this, a heavily
-        # over-segmented roof can match a tiny sliver wall whose azimuth
-        # happens to line up, and every opening then gets rejected by
-        # backproject_opening's own-footprint check since the ray never
-        # actually lands on it. Matched using the GPS-computed bearing to the
-        # building, not the camera's self-reported heading -- same
-        # unreliable-compass reasoning as in backproject_opening.
-        substantial = [w for w in walls if (w.along_max - w.along_min) * (w.z_max - w.z_min) >= MIN_WALL_AREA_M2]
-        candidates = substantial or walls
+        # Matched using the GPS-computed bearing to the building, not the
+        # camera's self-reported heading -- same unreliable-compass reasoning
+        # as in backproject_opening.
         match_bearing = image.bearing_from_image_deg if image.bearing_from_image_deg else image.heading_deg
-        wall = min(candidates, key=lambda w: angle_diff_deg(w.azimuth_deg, (match_bearing + 180) % 360))
+        wall = nearest_facing_wall(walls, match_bearing)
         walls_with_coverage.add(wall.surface_index)
 
         for rect in rects:
             poly = backproject_opening(rect, image, wall)
+            depth_ok = poly is not None
             if poly is None:
+                # Retry ignoring the depth check: if this now succeeds, depth
+                # was the *only* reason it failed (every other geometric
+                # check -- on-wall, in-front-of-camera -- still passed), so
+                # it's a real candidate for regularize_openings to weigh
+                # against the rest of this wall's floor bands rather than a
+                # simple reject.
+                poly = backproject_opening(rect, image, wall, ignore_depth_check=True)
+            if poly is None or not _is_plausible_opening_size(poly):
                 continue
-            openings_added.append({
+            p1, _p2, p3, _p4 = poly
+            candidates.append({
                 "wall_surface_index": wall.surface_index,
                 "type": classify_opening_type(poly, wall, rect.get("detected_label")),
                 "polygon": poly,
                 "confidence": rect["confidence"],
                 "source_image_id": image.id,
                 "approximate": True,
+                "depth_ok": depth_ok,
+                "z_center": (p1[2] + p3[2]) / 2,
             })
+
+    openings_added = regularize_openings(candidates)
+    for o in openings_added:
+        del o["depth_ok"], o["z_center"]
 
     lod31["+lod31_openings"] = openings_added
     lod31["+wall_coverage"] = {
@@ -1074,12 +1473,13 @@ def add_windows(lod22_path: Path, images: list[StreetImage], image_dir: Path, ou
 
 
 # ---------------------------------------------------------------------------
-# Stage 7: manifest
+# Stage 8: manifest
 # ---------------------------------------------------------------------------
 
 def write_manifest(work_dir: Path, address: str, geo: GeocodeResult, footprint_geojson: dict,
                     laz_path: Path, lod22_path: Path, lod31_path: Path,
-                    images: list[StreetImage]) -> Path:
+                    images: list[StreetImage], dims: dict, dims_diagram_path: Path,
+                    render_lod22_path: Path, render_lod31_path: Path) -> Path:
     manifest = {
         "address": address,
         "geocode": {"lat": geo.lat, "lon": geo.lon, "display_name": geo.display_name},
@@ -1087,6 +1487,10 @@ def write_manifest(work_dir: Path, address: str, geo: GeocodeResult, footprint_g
         "point_cloud": str(laz_path.relative_to(work_dir)),
         "lod22": str(lod22_path.relative_to(work_dir)),
         "lod31": str(lod31_path.relative_to(work_dir)),
+        "dimensions": dims,
+        "dimensions_diagram": str(dims_diagram_path.relative_to(work_dir)),
+        "render_lod22": str(render_lod22_path.relative_to(work_dir)),
+        "render_lod31": str(render_lod31_path.relative_to(work_dir)),
         "images": [
             {
                 "id": img.id, "url": img.url, "lat": img.lat, "lon": img.lon,
@@ -1110,33 +1514,51 @@ def run_pipeline(address: str, out_dir: str = "output") -> Path:
     work_dir = Path(out_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[1/7] geocoding {address!r}")
+    print(f"[1/8] geocoding {address!r}")
     geo = geocode(address)
     print(f"      -> {geo.lat:.6f}, {geo.lon:.6f} ({geo.display_name})")
 
-    print("[2/7] fetching building footprint")
+    print("[2/8] fetching building footprint")
     footprint_geojson = fetch_footprint(geo.lat, geo.lon)
 
-    print("[3/7] cropping lidar to footprint")
+    print("[3/8] cropping lidar to footprint")
     laz_path = crop_lidar_to_footprint(footprint_geojson, work_dir)
 
-    print("[4/7] fetching + filtering street-level images")
+    print("[4/8] fetching + filtering street-level images")
     all_images = fetch_kartaview_images(geo.lat, geo.lon)
     facing_images = filter_facing_images(all_images, geo.lat, geo.lon, footprint_geojson)
     print(f"      -> {len(facing_images)}/{len(all_images)} images face the building")
 
-    print("[5/7] running roofer for LOD 2.2")
+    print("[5/8] running roofer for LOD 2.2")
     footprint_path = write_projected_footprint_geojson(
         footprint_geojson, CONFIG["ns_lidar_epsg"], work_dir / "footprint.geojson"
     )
     lod22_path = run_roofer(footprint_path, laz_path, work_dir)
 
-    print("[6/7] detecting + back-projecting openings -> LOD 3.1")
-    lod31_path = add_windows(lod22_path, facing_images, work_dir / "images", work_dir / "lod31.city.json")
+    print("[6/8] computing building dimensions")
+    lod22_cityjson = json.loads(lod22_path.read_text())
+    dims = compute_building_dimensions(footprint_geojson, lod22_cityjson, CONFIG["ns_lidar_epsg"])
+    dims_diagram_path = render_dimensions_diagram(
+        footprint_geojson, CONFIG["ns_lidar_epsg"], dims, address, work_dir / "dimensions.png"
+    )
+    street_wall = determine_street_facing_wall(lod22_cityjson, facing_images)
+    render_lod22_path = render_building_model(
+        lod22_cityjson, dims, f"{address} - LOD2.2", work_dir / "render.png", face_wall=street_wall
+    )
+    print(f"      -> {dims['length_m']}m x {dims['width_m']}m footprint, {dims['height_m']}m tall")
 
-    print("[7/7] writing manifest")
+    print("[7/8] detecting + back-projecting openings -> LOD 3.1")
+    lod31_path = add_windows(lod22_path, facing_images, work_dir / "images", work_dir / "lod31.city.json")
+    lod31_cityjson = json.loads(lod31_path.read_text())
+    render_lod31_path = render_building_model(
+        lod31_cityjson, dims, f"{address} - LOD3.1 (final)\n{lod31_cityjson.get('+opening_type_counts')}",
+        work_dir / "render_lod31.png", openings=lod31_cityjson.get("+lod31_openings", []), face_wall=street_wall,
+    )
+
+    print("[8/8] writing manifest")
     manifest_path = write_manifest(work_dir, address, geo, footprint_geojson, laz_path,
-                                    lod22_path, lod31_path, facing_images)
+                                    lod22_path, lod31_path, facing_images, dims, dims_diagram_path,
+                                    render_lod22_path, render_lod31_path)
 
     print(f"done -> {manifest_path}")
     return manifest_path

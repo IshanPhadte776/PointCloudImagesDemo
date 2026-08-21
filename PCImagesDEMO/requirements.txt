@@ -3,6 +3,7 @@ pyproj
 shapely
 numpy
 pillow
+matplotlib
 transformers
 accelerate
 

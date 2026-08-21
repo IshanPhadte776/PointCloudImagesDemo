@@ -47,6 +47,33 @@
   "point_cloud": "building_crop.laz",
   "lod22": "lod22.city.json",
   "lod31": "lod31.city.json",
+  "dimensions": {
+    "length_m": 42.03,
+    "width_m": 16.24,
+    "height_m": 12.87,
+    "footprint_area_m2": 682.1,
+    "oriented_rect_corners": [
+      [
+        454772.5840387723,
+        4943262.169440021
+      ],
+      [
+        454812.2882500823,
+        4943275.969181345
+      ],
+      [
+        454817.62031514785,
+        4943260.627919984
+      ],
+      [
+        454777.91610383784,
+        4943246.82817866
+      ]
+    ]
+  },
+  "dimensions_diagram": "dimensions.png",
+  "render_lod22": "render.png",
+  "render_lod31": "render_lod31.png",
   "images": [
     {
       "id": "30935184",
